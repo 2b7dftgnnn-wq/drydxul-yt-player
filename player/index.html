@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>DRYDXUL Official YouTube Player</title>
+  <!--
+    Strict Referrer Policy: Send origin only (e.g. https://<domain>/) so YouTube player
+    receives a valid, consistent HTTPS Referer and passes embed origin checks without leaking parameters.
+  -->
+  <meta name="referrer" content="origin">
+  <!--
+    Strict Content Security Policy:
+    Restricted exclusively to official YouTube domains, static resources, and inline player bootstrapping.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' https://www.youtube.com https://s.ytimg.com; frame-src https://www.youtube.com https://www.youtube-nocookie.com; style-src 'unsafe-inline'; img-src https://i.ytimg.com data:; connect-src https://www.youtube.com https://*.googlevideo.com; media-src https://*.googlevideo.com; object-src 'none'; base-uri 'none';">
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background-color: #000;
+      overflow: hidden;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    #player {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+    }
+    #error-container {
+      display: none;
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      text-align: center;
+      padding: 24px;
+      max-width: 80%;
+      background: rgba(20, 20, 20, 0.9);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 8px;
+    }
+    #error-title {
+      font-size: 20px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: #ff4d4f;
+    }
+    #error-detail {
+      font-size: 14px;
+      color: #ccc;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <div id="player"></div>
+  <div id="error-container">
+    <div id="error-title">YouTube Player Error</div>
+    <div id="error-detail"></div>
+  </div>
+
+  <script>
+    (function() {
+      'use strict';
+
+      // 1. Strict Validation of YouTube Video ID (RFC 4648 Base64URL-like 11 characters)
+      var VIDEO_ID_REGEX = /^[a-zA-Z0-9_-]{11}$/;
+      var SESSION_NONCE_REGEX = /^[a-zA-Z0-9_-]{8,64}$/;
+
+      var params = new URLSearchParams(window.location.search);
+      var videoId = params.get('v');
+      var autoplay = params.get('autoplay') !== '0';
+      var startTime = parseInt(params.get('t') || '0', 10);
+      var sessionNonce = params.get('nonce') || null;
+      if (isNaN(startTime) || startTime < 0) startTime = 0;
+
+      // Validate sessionNonce format if supplied
+      if (sessionNonce && !SESSION_NONCE_REGEX.test(sessionNonce)) {
+        sessionNonce = null;
+      }
+
+      var errorContainer = document.getElementById('error-container');
+      var errorDetail = document.getElementById('error-detail');
+
+      function showError(title, detail) {
+        if (errorContainer && errorDetail) {
+          document.getElementById('error-title').textContent = title;
+          errorDetail.textContent = detail;
+          errorContainer.style.display = 'block';
+        }
+      }
+
+      function notifyParent(eventType, payload) {
+        var msg = {
+          type: 'DRYDXUL_YT_EVENT',
+          event: eventType,
+          videoId: videoId,
+          nonce: sessionNonce,
+          data: payload || {},
+          timestamp: Date.now()
+        };
+        // Post message back to parent. In Tizen file:/// context, origin is "null" or file://
+        try {
+          if (window.parent && window.parent !== window) {
+            window.parent.postMessage(JSON.stringify(msg), '*');
+          }
+        } catch (e) {
+          // Ignore messaging failures
+        }
+      }
+
+      if (!videoId || !VIDEO_ID_REGEX.test(videoId)) {
+        showError('Invalid Video ID', 'A valid 11-character YouTube video ID is required.');
+        notifyParent('onError', { error: 'INVALID_VIDEO_ID', code: 400 });
+        return;
+      }
+
+      // 2. Load YouTube IFrame API asynchronously
+      var tag = document.createElement('script');
+      tag.src = 'https://www.youtube.com/iframe_api';
+      var firstScriptTag = document.getElementsByTagName('script')[0];
+      firstScriptTag.parentNode.insertBefore(tag, firstScriptTag);
+
+      var ytPlayer = null;
+
+      window.onYouTubeIframeAPIReady = function() {
+        try {
+          ytPlayer = new YT.Player('player', {
+            videoId: videoId,
+            width: '100%',
+            height: '100%',
+            playerVars: {
+              autoplay: autoplay ? 1 : 0,
+              playsinline: 1,
+              rel: 0,
+              modestbranding: 1,
+              enablejsapi: 1,
+              origin: window.location.origin,
+              start: startTime
+            },
+            events: {
+              onReady: function(evt) {
+                notifyParent('onReady', {
+                  duration: ytPlayer.getDuration(),
+                  currentTime: ytPlayer.getCurrentTime(),
+                  videoData: ytPlayer.getVideoData ? ytPlayer.getVideoData() : null
+                });
+                if (autoplay) {
+                  evt.target.playVideo();
+                }
+              },
+              onStateChange: function(evt) {
+                // States: -1 (unstarted), 0 (ended), 1 (playing), 2 (paused), 3 (buffering), 5 (video cued)
+                notifyParent('onStateChange', {
+                  state: evt.data,
+                  currentTime: ytPlayer.getCurrentTime(),
+                  duration: ytPlayer.getDuration()
+                });
+              },
+              onError: function(evt) {
+                var errCode = evt.data;
+                var errDescription = 'Unknown error (' + errCode + ')';
+                if (errCode === 2) errDescription = 'Invalid parameter value';
+                else if (errCode === 5) errDescription = 'HTML5 player error';
+                else if (errCode === 100) errDescription = 'Video not found or removed';
+                else if (errCode === 101 || errCode === 150) errDescription = 'Playback disabled by video owner on this domain';
+                else if (errCode === 153) errDescription = 'Player configuration or origin error (153)';
+
+                showError('Playback Error (' + errCode + ')', errDescription);
+                notifyParent('onError', {
+                  error: errDescription,
+                  code: errCode
+                });
+              }
+            }
+          });
+        } catch (err) {
+          showError('Initialization Error', String(err));
+          notifyParent('onError', { error: String(err), code: 500 });
+        }
+      };
+
+      // 3. Parent-to-Player Command Handler via postMessage
+      window.addEventListener('message', function(evt) {
+        if (!evt || !evt.data) return;
+
+        // Security boundary: Only accept messages from immediate parent window
+        if (evt.source !== window.parent) return;
+
+        var data = evt.data;
+        if (typeof data === 'string') {
+          try {
+            data = JSON.parse(data);
+          } catch (e) {
+            return;
+          }
+        }
+
+        if (!data || data.type !== 'DRYDXUL_YT_COMMAND') return;
+
+        // Session nonce validation: If a session nonce was configured on gateway load,
+        // incoming commands MUST present a matching nonce.
+        if (sessionNonce && data.nonce !== sessionNonce) {
+          notifyParent('onSecurityViolation', { action: (data && data.action), error: 'NONCE_MISMATCH' });
+          return;
+        }
+
+        // Strict command allowlist: Reject any unrecognized or unexpected command by default
+        var ALLOWED_ACTIONS = ['PLAY', 'PAUSE', 'STOP', 'SEEK', 'DESTROY', 'GET_STATUS'];
+        var action = data.action;
+        if (!action || typeof action !== 'string' || ALLOWED_ACTIONS.indexOf(action) === -1) {
+          notifyParent('onSecurityViolation', { action: action, error: 'UNKNOWN_OR_DISALLOWED_COMMAND' });
+          return;
+        }
+
+        if (!ytPlayer) return;
+
+        try {
+          switch (action) {
+            case 'PLAY':
+              if (typeof ytPlayer.playVideo === 'function') ytPlayer.playVideo();
+              break;
+            case 'PAUSE':
+              if (typeof ytPlayer.pauseVideo === 'function') ytPlayer.pauseVideo();
+              break;
+            case 'STOP':
+              if (typeof ytPlayer.stopVideo === 'function') ytPlayer.stopVideo();
+              break;
+            case 'SEEK':
+              var targetSec = parseFloat(data.seconds);
+              if (!isNaN(targetSec) && targetSec >= 0 && typeof ytPlayer.seekTo === 'function') {
+                ytPlayer.seekTo(targetSec, true);
+              }
+              break;
+            case 'DESTROY':
+              if (typeof ytPlayer.destroy === 'function') ytPlayer.destroy();
+              ytPlayer = null;
+              break;
+            case 'GET_STATUS':
+              notifyParent('statusUpdate', {
+                state: (ytPlayer.getPlayerState ? ytPlayer.getPlayerState() : -1),
+                currentTime: (ytPlayer.getCurrentTime ? ytPlayer.getCurrentTime() : 0),
+                duration: (ytPlayer.getDuration ? ytPlayer.getDuration() : 0),
+                isMuted: (ytPlayer.isMuted ? ytPlayer.isMuted() : false),
+                volume: (ytPlayer.getVolume ? ytPlayer.getVolume() : 100)
+              });
+              break;
+            default:
+              break;
+          }
+        } catch (e) {
+          notifyParent('onCommandError', { action: action, error: String(e) });
+        }
+      }, false);
+
+      // Periodically report playback progress if playing
+      setInterval(function() {
+        if (ytPlayer && typeof ytPlayer.getPlayerState === 'function' && ytPlayer.getPlayerState() === 1) {
+          notifyParent('playbackProgress', {
+            currentTime: ytPlayer.getCurrentTime(),
+            duration: ytPlayer.getDuration()
+          });
+        }
+      }, 1000);
+
+    })();
+  </script>
+</body>
+</html>
